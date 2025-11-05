@@ -1,13 +1,13 @@
 # My proposal for the agent :
 
 ## Graph Representation
-<img width="1716" height="1184" alt="image" src="https://github.com/user-attachments/assets/38bebac5-0622-4d46-822e-109286a89ebb" />
+<img width="1016" height="1292" alt="image" src="https://github.com/user-attachments/assets/3ea898bc-62e9-4a92-b45c-2ff9b721cc8c" />
 
 
 
-A. The Inspector will be beautifulsoup
+A. The Inspector will be PlayWright
 
-B. The Actor will be selenium
+B. The Actor will be PlayWright
 
 C. The Planner will be openAI 
 
