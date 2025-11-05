@@ -1,5 +1,10 @@
 # My proposal for the agent :
 
+## Graph Representation
+<img width="1716" height="1184" alt="image" src="https://github.com/user-attachments/assets/38bebac5-0622-4d46-822e-109286a89ebb" />
+
+
+
 A. The Inspector will be beautifulsoup
 
 B. The Actor will be selenium
