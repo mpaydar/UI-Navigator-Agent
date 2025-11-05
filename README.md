@@ -8,7 +8,7 @@ C. The Planner will be openAI
 
 ### Human Message: can be any task to be perform on any platform
 
-    ### Example: Show me how to create a project on linear platform
+     Example: Show me how to create a project on linear platform
 
 ### System Message:  You are a smart planner. You ask for the current UI content from the inspector. Then, You choose the appropriate selector according to the current goal and you pass the selector to the actor to take action. You will be recursively perform the following steps: 
 
