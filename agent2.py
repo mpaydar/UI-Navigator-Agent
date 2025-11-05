@@ -1,792 +1,410 @@
-# general_ui_agent_v3.py
-# pip install langgraph langchain-openai selenium webdriver-manager python-dotenv
-# .env: OPENAI_API_KEY=...
-
-from typing import Annotated, Sequence, TypedDict, Literal, Optional, List, Tuple, Dict, Any
-import os, json, time, pathlib, re, hashlib
-from urllib.parse import urlparse
+from typing import TypedDict, Union
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from dotenv import load_dotenv
-
-# LangGraph / LangChain
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
-from langgraph.graph.message import add_messages
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-
-# Selenium
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-
-# ===================== Setup & Globals =====================
+from playwright.sync_api import sync_playwright, Page
+from openai import OpenAI
+import time
+import base64
+import json
+import re
 load_dotenv()
-STEP_DIR = pathlib.Path("steps"); STEP_DIR.mkdir(exist_ok=True)
 
-def _truncate(s: str, n: int = 160) -> str:
-    s = (s or "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return (s[: n-1] + "…") if len(s) > n else s
+# Global playwright resources (will be initialized in main)
+_playwright = None
+_browser = None
+_context = None
+_page = None
 
-def _hash(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+def get_page() -> Page:
+    """Get or create page instance"""
+    global _playwright, _browser, _context, _page
+    if _page is None:
+        _playwright = sync_playwright().start()
+        _browser = _playwright.chromium.launch(headless=False)
+        _context = _browser.new_context(viewport={"width": 1280, "height": 800})
+        _page = _context.new_page()
+    return _page
 
-def snap(tag: str) -> str:
-    """Save a full-page screenshot of the current browser."""
-    p = STEP_DIR / f"{int(time.time()*1000)}_{tag}.png"
-    _SESSION.driver.save_screenshot(str(p))
-    return str(p)
+def cleanup_browser():
+    """Clean up playwright resources"""
+    global _playwright, _browser, _context, _page
+    if _context:
+        _context.close()
+    if _browser:
+        _browser.close()
+    if _playwright:
+        _playwright.stop()
+    _page = None
+    _context = None
+    _browser = None
+    _playwright = None
 
-def _domain_allowed(allowlist: List[str], url: str) -> bool:
-    if not allowlist: return True
-    host = urlparse(url).netloc
-    return any(host.endswith(urlparse(p).netloc) for p in allowlist)
-
-# ================= Selenium Session (singleton) =================
-class SeleniumSession:
-    """Holds one Chrome session reused by tools."""
-    driver: Optional[webdriver.Chrome] = None
-    wait: Optional[WebDriverWait] = None
-    allowlist: List[str] = []
-    cookies_path: str = "session_cookies.json"
-
-    def ensure(self, headed: bool = True, user_data_dir: Optional[str] = None, profile_dir: Optional[str] = None):
-        if self.driver: return
-        opts = webdriver.ChromeOptions()
-        if headed:
-            opts.add_argument("--start-maximized")
-        else:
-            opts.add_argument("--headless=new")
-            opts.add_argument("--window-size=1366,860")
-        if user_data_dir: opts.add_argument(f"--user-data-dir={user_data_dir}")
-        if profile_dir: opts.add_argument(f"--profile-directory={profile_dir}")
-        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-        self.wait = WebDriverWait(self.driver, 30)
-
-    def check_url(self, url: str):
-        if not _domain_allowed(self.allowlist, url):
-            raise PermissionError(f"URL '{url}' blocked by allowlist {self.allowlist}")
-
-    def save_cookies(self):
-        cookies = self.driver.get_cookies()
-        pathlib.Path(self.cookies_path).write_text(json.dumps(cookies, indent=2))
-
-    def load_cookies(self, domain_hint: str) -> bool:
-        path = pathlib.Path(self.cookies_path)
-        if not path.exists(): return False
-        cookies = json.loads(path.read_text())
-        self.driver.get(domain_hint)
-        time.sleep(0.5)
-        ok = 0
-        for c in cookies:
-            try:
-                self.driver.add_cookie(c); ok += 1
-            except Exception:
-                pass
-        self.driver.refresh()
-        return ok > 0
-
-_SESSION = SeleniumSession()
-
-# ================ Helpers / Heuristics ==================
-def _detect_logged_in(url: str, dom_html: str) -> bool:
-    """
-    Heuristic: True if app likely past login.
-    Works across many apps, not Linear-specific.
-    """
-    if not url:
-        return False
-
-    # Common post-login signals
-    path_hits = re.search(r"/(team|issues?|projects?|tasks?|workspace|dashboard|inbox|active|backlog)(/|$)", url, re.I)
-    host_hits = re.search(r"(app\.)", url)  # app subdomain is common
-    if path_hits or host_hits:
-        return True
-
-    # DOM fallback (common nav labels)
-    if dom_html and re.search(r"\b(Inbox|My issues|Projects|Backlog|Active|Dashboard|Home)\b", dom_html, re.I):
-        return True
-
-    # Not obviously login page
-    if "login" not in url and "signin" not in url and "auth" not in url:
-        return True
-
-    return False
-
-def _by_from_locator(kind: str, value: str, name: Optional[str]=None) -> Tuple[By, str]:
-    """Translate abstract locators to Selenium selectors (general, not app specific)."""
-    if kind == "role":
-        if value == "link":
-            if name: return By.XPATH, f'//a[normalize-space(.)={json.dumps(name)}]'
-            return By.TAG_NAME, "a"
-        if value == "button":
-            if name: return By.XPATH, f'//*[(self::button or @role="button") and normalize-space(.)={json.dumps(name)}]'
-            return By.XPATH, '//*[self::button or @role="button"]'
-        if value == "textbox":
-            if not name: return By.XPATH, '//*[self::input or self::textarea]'
-            nm = name; nml = name.lower()
-            xp = (
-                f'//input[@aria-label={json.dumps(nm)} or @placeholder={json.dumps(nm)}'
-                f' or translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")={json.dumps(nml)}]'
-                f' | //textarea[@aria-label={json.dumps(nm)} or @placeholder={json.dumps(nm)}]'
-                f' | //label[normalize-space(.)={json.dumps(nm)}]/following::input[1]'
-            )
-            return By.XPATH, xp
-        if name:
-            return By.XPATH, f'//*[@role="{value}" and normalize-space(.)={json.dumps(name)}]'
-        return By.CSS_SELECTOR, f'[role="{value}"]'
-    if kind == "testid":
-        return By.CSS_SELECTOR, f'[data-testid="{value}"]'
-    if kind == "text":
-        return By.XPATH, f'//*[normalize-space(.)={json.dumps(value)}]'
-    if kind == "css":
-        return By.CSS_SELECTOR, value
-    if kind == "xpath":
-        return By.XPATH, value
-    raise ValueError(f"Unknown locator kind: {kind}")
-
-def _is_displayed(el) -> bool:
-    try:
-        return el.is_displayed() and el.is_enabled()
-    except Exception:
-        return False
-
-def _highlight(el):
-    try:
-        _SESSION.driver.execute_script("arguments[0].style.outline='3px solid magenta';", el)
-    except Exception:
-        pass
-
-def _candidate_dialog_roots() -> List[Any]:
-    """Return likely modal/dialog containers first, then document."""
-    d = _SESSION.driver
-    candidates = []
-    selectors = [
-        # very common dialog patterns
-        "[role='dialog']",
-        "[aria-modal='true']",
-        ".ReactModal__Content",
-        ".modal, .Modal, .ant-modal-content, .mantine-Modal-content, .MuiDialog-container, .chakra-modal__content",
-        "[data-overlay-container], [data-state='open']",
-    ]
-    for sel in selectors:
-        try:
-            for el in d.find_elements(By.CSS_SELECTOR, sel):
-                if _is_displayed(el):
-                    candidates.append(el)
-        except Exception:
-            pass
-    candidates.append(d.find_element(By.TAG_NAME, "body"))
-    return candidates
-
-def _visible_elements(root, by: By, selector: str) -> List[Any]:
-    try:
-        els = root.find_elements(by, selector)
-    except Exception:
-        return []
-    return [e for e in els if _is_displayed(e)]
-
-def _smart_text_fields(scope: str = "dialog") -> List[Any]:
-    """Find visible text-like fields (input/textarea/contenteditable), dialog-first."""
-    roots = _candidate_dialog_roots() if scope == "dialog" else [_SESSION.driver.find_element(By.TAG_NAME, "body")]
-    for r in roots:
-        # Inputs / textareas
-        candidates: List[Any] = []
-        for sel in [
-            "input[type='text']",
-            "input:not([type]), input[type='search'], input[type='url'], input[type='email']",
-            "textarea",
-            "[contenteditable=''], [contenteditable='true']",
-            "input[placeholder], textarea[placeholder]",
-        ]:
-            candidates += _visible_elements(r, By.CSS_SELECTOR, sel)
-        # Filter out obvious non-editables (checkbox, radio etc.)
-        res = []
-        for e in candidates:
-            try:
-                tag = e.tag_name.lower()
-                typ = (e.get_attribute("type") or "").lower()
-                if tag == "input" and typ in {"checkbox","radio","hidden","file","button","submit"}:
-                    continue
-                res.append(e)
-            except Exception:
-                continue
-        if res:
-            return res
-    return []
-
-def _smart_buttons(texts: List[str], scope: str = "dialog") -> List[Any]:
-    """Find visible buttons whose text contains any candidate string (case-insensitive)."""
-    roots = _candidate_dialog_roots() if scope == "dialog" else [_SESSION.driver.find_element(By.TAG_NAME, "body")]
-    pat = re.compile("|".join([re.escape(t) for t in texts]), re.I) if texts else re.compile(r".+")
-    for r in roots:
-        els: List[Any] = []
-        # buttons, role=button, inputs that act as buttons
-        for sel in ["button", "[role='button']", "input[type='submit']", "input[type='button']"]:
-            els += _visible_elements(r, By.CSS_SELECTOR, sel)
-        # Now score by text match
-        scored = []
-        for e in els:
-            try:
-                txt = (e.text or "").strip()
-                if not txt:
-                    txt = (e.get_attribute("value") or "").strip()
-                if pat.search(txt):
-                    scored.append((len(txt), e))
-            except Exception:
-                continue
-        if scored:
-            # Prefer shorter/more exact-looking labels
-            scored.sort(key=lambda t: t[0])
-            return [e for _, e in scored]
-    return []
-
-# ===================== LangGraph State =======================
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+    messages: list[Union[HumanMessage, SystemMessage, AIMessage]]
+    screenshot: str
+    img_base64: str
+    goal: str
+    selector: str
+    action_type: str  # 'click' or 'type'
+    action_text: str  # Text to type (if action_type is 'type')
+    visible_buttons: list[str]
+    visible_inputs: list[str]
+    is_first_visit: bool  # Track if this is the first inspection
 
-# ==================== Primitive Action Tools ==================
-@tool
-def start_session(allowlist: List[str],
-                  headed: bool = True,
-                  user_data_dir: Optional[str] = None,
-                  profile_dir: Optional[str] = None) -> str:
-    """Start browser session with domain allowlist. Headed mode shows browser window."""
-    _SESSION.allowlist = allowlist
-    _SESSION.ensure(headed=headed, user_data_dir=user_data_dir, profile_dir=profile_dir)
-    return json.dumps({"ok": True, "headed": headed, "allowlist": allowlist})
-
-@tool
-def open_url(url: str) -> str:
-    """Navigate to URL (must be allowlisted) and screenshot."""
-    _SESSION.ensure()
-    _SESSION.check_url(url)
-    _SESSION.driver.get(url)
-    _SESSION.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-    shot = snap("after_nav")
-    return json.dumps({"ok": True, "url": _SESSION.driver.current_url, "screenshot": shot})
-
-@tool
-def restore_cookies(domain_hint: str) -> str:
-    """Load saved cookies from disk to restore login session."""
-    _SESSION.ensure()
-    ok = _SESSION.load_cookies(domain_hint)
-    return json.dumps({"ok": ok, "url": _SESSION.driver.current_url})
-
-@tool
-def persist_cookies() -> str:
-    """Save current cookies to disk for future sessions."""
-    _SESSION.ensure()
-    _SESSION.save_cookies()
-    return json.dumps({"ok": True})
-
-@tool
-def wait_url_contains(fragment: str, timeout_sec: int = 30) -> str:
-    """Wait until current URL contains the specified fragment."""
-    _SESSION.ensure()
-    WebDriverWait(_SESSION.driver, timeout_sec).until(lambda d: fragment in (d.current_url or ""))
-    return json.dumps({"ok": True, "url": _SESSION.driver.current_url})
-
-@tool
-def click(kind: Literal["role","testid","text","css","xpath"], value: str, name: Optional[str]=None) -> str:
-    """Click an element by locator. Takes before/after screenshots."""
-    _SESSION.ensure()
-    by, sel = _by_from_locator(kind, value, name)
-    el = _SESSION.wait.until(EC.element_to_be_clickable((by, sel)))
-    _highlight(el)
-    before = snap("before_click")
-    ActionChains(_SESSION.driver).move_to_element(el).pause(0.12).click(el).perform()
-    time.sleep(0.25)
-    after = snap("after_click")
-    return json.dumps({"ok": True, "before": before, "after": after})
-
-@tool
-def fill(kind: Literal["role","testid","text","css","xpath"], value: str, text: str, name: Optional[str]=None) -> str:
-    """Fill a specific located input field with text. Takes before/after screenshots."""
-    _SESSION.ensure()
-    by, sel = _by_from_locator(kind, value, name)
-    el = _SESSION.wait.until(EC.visibility_of_element_located((by, sel)))
-    _highlight(el)
-    before = snap("before_fill")
-    try: el.clear()
-    except Exception: pass
-    el.click()
-    # Select-all then type to be robust
-    if os.uname().sysname == "Darwin":
-        el.send_keys(Keys.COMMAND, "a")
+def inspector(state: AgentState) -> AgentState:
+    """Navigate to website and take screenshot"""
+    page = get_page()
+    is_first = state.get("is_first_visit", True)
+    
+    if is_first:
+        print("📸 Inspector: Navigating to Linear...")
+        page.goto("https://www.linear.app", wait_until="load", timeout=60000)
+        page.wait_for_timeout(2000)  # Let page hydrate
+        state["is_first_visit"] = False
     else:
-        el.send_keys(Keys.CONTROL, "a")
-    el.send_keys(text)
-    # JS fallback for frameworks that ignore send_keys changes until blur
-    try:
-        _SESSION.driver.execute_script("""
-            const el = arguments[0], val = arguments[1];
-            if (el.isContentEditable) { el.textContent = val; }
-            else if ('value' in el) { el.value = val; }
-            el.dispatchEvent(new Event('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        """, el, text)
-    except Exception:
-        pass
-    time.sleep(0.15)
-    after = snap("after_fill")
-    return json.dumps({"ok": True, "before": before, "after": after, "text_len": len(text)})
+        print("📸 Inspector: Taking screenshot of current page...")
+        page.wait_for_timeout(1000)  # Wait for animations to settle
+        
+    # Check for authentication pages - pause for manual login
+    current_url = page.url
+    if '/login' in current_url or '/signup' in current_url or '/auth' in current_url:
+        print("\n" + "="*70)
+        print("🔐 AUTHENTICATION REQUIRED")
+        print("="*70)
+        print(f"Current URL: {current_url}")
+        print("\nPlease log in MANUALLY in the browser window.")
+        print("="*70)
+        input("\nPress ENTER after you've logged in: ")
+        page.wait_for_timeout(2000)
+        print(f"\n✅ Continuing from: {page.url}\n")
+    
+    # Get all visible buttons and links
+    visible_buttons = page.locator("button:visible, a:visible").all()
+    state["visible_buttons"] = [el.inner_text().strip() for el in visible_buttons if el.inner_text().strip()]
+    
+    print("\nVISIBLE BUTTONS / LINKS:")
+    for i, text in enumerate(state["visible_buttons"][:10]):
+        print(f"{i+1}. {text}")
 
-@tool
-def screenshot(scope: Literal["page","element"]="page",
-               kind: Optional[Literal["role","testid","text","css","xpath"]]=None,
-               value: Optional[str]=None,
-               name: Optional[str]=None) -> str:
-    """Take a screenshot of the full page or specific element."""
-    _SESSION.ensure()
-    if scope == "page" or not kind or not value:
-        path = snap("page")
-        return json.dumps({"ok": True, "path": path})
-    by, sel = _by_from_locator(kind, value, name)
-    el = _SESSION.wait.until(EC.visibility_of_element_located((by, sel)))
-    _highlight(el)
-    path = snap(f"elem_{kind}")
-    return json.dumps({"ok": True, "path": path})
-
-# ==================== Generic High-Value Tools ====================
-@tool
-def fill_first_text_field(text: str, scope: Literal["dialog","page"] = "dialog") -> str:
-    """
-    Fill the first visible text field in the current scope (dialog-first by default).
-    Supports input, textarea, and contenteditable nodes. JS fallback included.
-    """
-    _SESSION.ensure()
-    fields = _smart_text_fields(scope=scope)
-    if not fields:
-        shot = snap("fill_first_text_field_no_field")
-        return json.dumps({"ok": False, "error": "no text fields found", "screenshot": shot})
-    el = fields[0]
-    _SESSION.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    _highlight(el)
-    before = snap("before_fill_any")
-    try:
-        el.click()
-        # Select-all then type
-        if os.uname().sysname == "Darwin":
-            el.send_keys(Keys.COMMAND, "a")
-        else:
-            el.send_keys(Keys.CONTROL, "a")
-        el.send_keys(text)
-        # JS fallback to ensure frameworks pick it up
-        _SESSION.driver.execute_script("""
-            const el = arguments[0], val = arguments[1];
-            if (el.isContentEditable) { el.textContent = val; }
-            else if ('value' in el) { el.value = val; }
-            el.dispatchEvent(new Event('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        """, el, text)
-    except Exception as e:
-        shot = snap("fill_first_text_field_error")
-        return json.dumps({"ok": False, "error": str(e), "screenshot": shot})
-    after = snap("after_fill_any")
-    return json.dumps({"ok": True, "before": before, "after": after})
-
-@tool
-def click_button_by_text(candidates: List[str], scope: Literal["dialog","page"] = "dialog") -> str:
-    """
-    Click a visible button whose text contains any of the candidate strings (case-insensitive).
-    Works with <button>, [role=button], and input[type=submit/button].
-    """
-    _SESSION.ensure()
-    btns = _smart_buttons(candidates, scope=scope)
-    if not btns:
-        shot = snap("click_button_by_text_no_button")
-        return json.dumps({"ok": False, "error": "no matching buttons", "screenshot": shot})
-    el = btns[0]
-    _SESSION.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    _highlight(el)
-    before = snap("before_click_button")
-    try:
-        ActionChains(_SESSION.driver).move_to_element(el).pause(0.1).click(el).perform()
-    except Exception as e:
-        shot = snap("click_button_by_text_error")
-        return json.dumps({"ok": False, "error": str(e), "screenshot": shot})
-    time.sleep(0.3)
-    after = snap("after_click_button")
-    return json.dumps({"ok": True, "before": before, "after": after})
-
-# ==================== Snapshot/Digest Tool ====================
-def _attr(e, name) -> str:
-    try: return e.get_attribute(name) or ""
-    except Exception: return ""
-
-def _collect_digest(limit_each: int = 70) -> Dict[str, Any]:
-    d = _SESSION.driver
-    dom_html = d.execute_script("return document.documentElement.outerHTML || '';")
-
-    digest: Dict[str, Any] = {
-        "url": d.current_url or "",
-        "title": d.title or "",
-        "dom_hash": _hash(dom_html)[:16],  # progress detection
-        "logged_in_guess": _detect_logged_in(d.current_url, dom_html),
-        "headings": [],
-        "links": [],
-        "buttons": [],
-        "inputs": [],
-    }
-    # headings
-    for tag in ["h1","h2","h3"]:
+    # Get visible inputs INCLUDING contenteditable divs (rich text editors)
+    visible_inputs = page.locator("input:visible, textarea:visible, [contenteditable='true']:visible, [role='textbox']:visible").all()
+    input_descriptors = []
+    
+    print("\nVISIBLE INPUT FIELDS:")
+    for i, inp in enumerate(visible_inputs[:15]):
         try:
-            for h in d.find_elements(By.TAG_NAME, tag)[:limit_each]:
-                t = _truncate(h.text or "")
-                if t: digest["headings"].append({"tag": tag, "text": t})
-        except Exception: pass
-    # links
-    try:
-        for a in d.find_elements(By.TAG_NAME, "a")[:limit_each]:
-            t = _truncate(a.text or ""); href = _attr(a, "href")
-            if t or href:
-                digest["links"].append({"text": t, "href": href, "role": _attr(a,"role")})
-    except Exception: pass
-    # buttons
-    try:
-        for b in d.find_elements(By.TAG_NAME, "button")[:limit_each]:
-            t = _truncate(b.text or "")
-            digest["buttons"].append({"text": t, "role": _attr(b,"role")})
-    except Exception: pass
-    # inputs / textareas
-    try:
-        ins = d.find_elements(By.TAG_NAME, "input")[:limit_each]
-        tas = d.find_elements(By.TAG_NAME, "textarea")[:limit_each]
-        for e in ins + tas:
-            digest["inputs"].append({
-                "tag": e.tag_name,
-                "type": _attr(e,"type"),
-                "name": _attr(e,"name"),
-                "id": _attr(e,"id"),
-                "placeholder": _truncate(_attr(e,"placeholder")),
-                "aria-label": _truncate(_attr(e,"aria-label")),
-                "data-testid": _attr(e,"data-testid"),
-            })
-    except Exception: pass
-    # Size guard
-    as_json = json.dumps(digest)
-    if len(as_json) > 180_000:
-        digest["links"] = digest["links"][:40]
-        digest["buttons"] = digest["buttons"][:40]
-        digest["inputs"] = digest["inputs"][:40]
-    return digest
-
-@tool
-def snapshot_elements() -> str:
-    """Collect digest of interactive elements + screenshot."""
-    _SESSION.ensure()
-    dig = _collect_digest()
-    img = snap("snapshot")
-    return json.dumps({"ok": True, "digest": dig, "screenshot": img})
-
-# =================== Planner & Parsing ==================
-PLANNER_SYS = SystemMessage(content=(
-    "You are a strict, general UI automation planner.\n"
-    "INPUT: {\"goal\": str, \"page\": digest, \"already_logged_in\": bool, \"credentials\": {\"email\": str, \"password\": str}}\n"
-    "OUTPUT: ONLY valid JSON with schema:\n"
-    '{\"steps\":[{\"op\":\"click\"|\"fill\"|\"fill_first_text_field\"|\"click_button_by_text\"|\"screenshot\"|\"open_url\"|\"wait_url_contains\",'
-    '\"locator\":{\"strategy\":\"role\"|\"testid\"|\"text\"|\"css\"|\"xpath\",\"value\":str,\"name\":str|null},'
-    '\"text\":str|null,\"candidates\": [str]|null, \"scope\": \"dialog\"|\"page\"|null}],'
-    '\"rationale\":str,\"confidence\":number}\n\n'
-    "Rules:\n"
-    "- If already_logged_in is true, SKIP login steps and focus ONLY on the goal.\n"
-    "- For creation modals: use fill_first_text_field(name, scope='dialog') then click_button_by_text(['Create project','Create','Save'], scope='dialog').\n"
-    "- Prefer dialog scope when a modal is present.\n"
-    "- Keep steps atomic; end with a screenshot.\n"
-))
-
-def _extract_json_from_text(text: str) -> Optional[str]:
-    text = (text or "").strip()
-    if text.startswith("```json"): text = text[7:]
-    if text.startswith("```"): text = text[3:]
-    if text.endswith("```"): text = text[:-3]
-    text = text.strip()
-    start = text.find("{"); end = text.rfind("}")
-    if start >= 0 and end > start: return text[start:end+1]
-    return text
-
-def _coerce_plan_from_text(text: str) -> Dict[str, Any]:
-    if not text:
-        return {"steps": [{"op": "screenshot"}], "rationale": "empty", "confidence": 0.0}
-    js = _extract_json_from_text(text)
-    try:
-        obj = json.loads(js)
-        if isinstance(obj, dict) and "steps" in obj: return obj
-    except Exception:
-        pass
-    return {"steps": [{"op": "screenshot"}], "rationale": "could not parse", "confidence": 0.0}
-
-@tool
-def propose_actions(goal: str, digest: Optional[Dict[str, Any]] = None) -> str:
-    """Generate action plan to achieve goal based on current page digest."""
-    if digest is None:
-        digest = _collect_digest()
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    planner_input = {
-        "goal": goal,
-        "page": digest,
-        "already_logged_in": digest.get("logged_in_guess", False),
-        "credentials": {
-            "email": os.getenv("LINEAR_EMAIL", ""),
-            "password": os.getenv("LINEAR_PASSWORD", "")
-        }
-    }
-    resp = llm.invoke([PLANNER_SYS, HumanMessage(content=json.dumps(planner_input, ensure_ascii=False))])
-    content = resp.content
-    plan = content if isinstance(content, dict) else _coerce_plan_from_text(str(content))
-    steps = plan.get("steps")
-    if not isinstance(steps, list) or not steps:
-        plan = {"steps": [{"op": "screenshot"}], "rationale": "invalid plan; fallback", "confidence": 0.0}
-    return json.dumps({"ok": True, "plan": plan})
-
-# ================= Execute plan with verification =================
-def _resolve_locator(loc: Dict[str, Any]) -> Tuple[By, str]:
-    strat = loc.get("strategy"); val = loc.get("value"); nm = loc.get("name")
-    if strat == "placeholder":  # convenience
-        strat = "css"; val = f"input[placeholder*='{val}'], textarea[placeholder*='{val}']"
-    if strat not in {"role","testid","text","css","xpath"}: raise ValueError(f"Unsupported strategy: {strat}")
-    if not val: raise ValueError("Locator missing 'value'")
-    return _by_from_locator(strat, val, nm)
-
-@tool
-def execute_plan(plan: Dict[str, Any], allow_screens: bool = True) -> str:
-    """Execute a sequence of UI actions from the plan with verification screenshots."""
-    _SESSION.ensure()
-    out_steps = []
-    for idx, st in enumerate(plan.get("steps", []), start=1):
-        op = st.get("op")
-        try:
-            if op == "open_url":
-                url = st.get("text") or st.get("url") or st.get("locator", {}).get("value") or ""
-                if not url: raise ValueError("open_url requires URL")
-                _SESSION.check_url(url)
-                _SESSION.driver.get(url)
-                _SESSION.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-                path = snap(f"{idx:02d}_after_nav")
-                out_steps.append({"op": op, "ok": True, "shot": path, "url": _SESSION.driver.current_url})
-
-            elif op == "wait_url_contains":
-                frag = st.get("text") or ""
-                if not frag: raise ValueError("wait_url_contains requires 'text'")
-                WebDriverWait(_SESSION.driver, 30).until(lambda d: frag in (d.current_url or ""))
-                out_steps.append({"op": op, "ok": True, "url": _SESSION.driver.current_url})
-
-            elif op == "fill_first_text_field":
-                scope = st.get("scope") or "dialog"
-                res = json.loads(fill_first_text_field.invoke({"text": st.get("text") or "", "scope": scope}))
-                out_steps.append({"op": op, **res})
-
-            elif op == "click_button_by_text":
-                scope = st.get("scope") or "dialog"
-                cands = st.get("candidates") or []
-                res = json.loads(click_button_by_text.invoke({"candidates": cands, "scope": scope}))
-                out_steps.append({"op": op, **res})
-
-            elif op == "click":
-                by, sel = _resolve_locator(st.get("locator", {}))
-                el = _SESSION.wait.until(EC.element_to_be_clickable((by, sel)))
-                _highlight(el)
-                before = snap(f"{idx:02d}_before_click")
-                ActionChains(_SESSION.driver).move_to_element(el).pause(0.12).click(el).perform()
-                time.sleep(0.25)
-                after = snap(f"{idx:02d}_after_click") if allow_screens else ""
-                out_steps.append({"op": op, "ok": True, "before": before, "after": after})
-
-            elif op == "fill":
-                by, sel = _resolve_locator(st.get("locator", {}))
-                text = st.get("text") or ""
-                el = _SESSION.wait.until(EC.visibility_of_element_located((by, sel)))
-                _highlight(el)
-                before = snap(f"{idx:02d}_before_fill")
-                try: el.clear()
-                except Exception: pass
-                el.click()
-                if os.uname().sysname == "Darwin":
-                    el.send_keys(Keys.COMMAND, "a")
+            tag_name = inp.evaluate("el => el.tagName.toLowerCase()")
+            inp_type = inp.get_attribute("type") or "text"
+            name = inp.get_attribute("name") or ""
+            placeholder = inp.get_attribute("placeholder") or ""
+            aria_label = inp.get_attribute("aria-label") or ""
+            role = inp.get_attribute("role") or ""
+            
+            # Create detailed descriptor
+            if tag_name == "div" and role == "textbox":
+                descriptor = f"Editable div (rich text)"
+                if aria_label:
+                    descriptor += f" aria-label='{aria_label}'"
+                    print(f"{i+1}. Rich text field: aria-label='{aria_label}'")
                 else:
-                    el.send_keys(Keys.CONTROL, "a")
-                el.send_keys(text)
-                try:
-                    _SESSION.driver.execute_script("""
-                        const el = arguments[0], val = arguments[1];
-                        if (el.isContentEditable) { el.textContent = val; }
-                        else if ('value' in el) { el.value = val; }
-                        el.dispatchEvent(new Event('input', {bubbles:true}));
-                        el.dispatchEvent(new Event('change', {bubbles:true}));
-                    """, el, text)
-                except Exception:
-                    pass
-                after = snap(f"{idx:02d}_after_fill") if allow_screens else ""
-                out_steps.append({"op": op, "ok": True, "before": before, "after": after, "len": len(text)})
-
-            elif op == "screenshot":
-                p = snap(f"{idx:02d}_page")
-                out_steps.append({"op": op, "ok": True, "path": p})
-
+                    print(f"{i+1}. Rich text field (contenteditable div)")
             else:
-                out_steps.append({"op": op, "ok": False, "error": f"unsupported op '{op}'"})
-        except Exception as e:
-            fail_shot = snap(f"{idx:02d}_error")
-            out_steps.append({"op": op, "ok": False, "error": str(e), "shot": fail_shot})
-            break
+                descriptor = f"Input type={inp_type}"
+                if placeholder:
+                    descriptor += f" placeholder='{placeholder}'"
+                    print(f"{i+1}. {tag_name}: placeholder='{placeholder}', Name: {name}")
+                elif name:
+                    descriptor += f" name='{name}'"
+                    print(f"{i+1}. {tag_name}: name='{name}'")
+                elif aria_label:
+                    descriptor += f" aria-label='{aria_label}'"
+                    print(f"{i+1}. {tag_name}: aria-label='{aria_label}'")
+                else:
+                    print(f"{i+1}. {tag_name} type={inp_type}")
+            
+            input_descriptors.append(descriptor)
+        except:
+            pass
+    
+    state["visible_inputs"] = input_descriptors
+    
+    # Take screenshot
+    page.screenshot(path="step_current.png")
+    with open("step_current.png", "rb") as f:
+        state["img_base64"] = base64.b64encode(f.read()).decode("utf-8")
+    print("📸 Screenshot saved: step_current.png\n")
+    
+    return state
 
-    return json.dumps({"ok": True, "executed": out_steps})
+       
+def planner(state: AgentState) -> AgentState:
+    """Analyze screenshot with GPT-4 Vision and plan next action"""
+    print("🤖 Planner: Analyzing screenshot with GPT-4 Vision...")
+    all_visible_elements = state["visible_buttons"] + state["visible_inputs"]
+    all_visible_elements_string = "\n".join(all_visible_elements)
 
-# ================= Iterative high-level loop =================
-@tool
-def run_goal(goal: str, max_iters: int = 12, wait_hint: Optional[str] = None) -> str:
-    """
-    Iteratively: snapshot -> propose -> execute -> verify progress.
-    Stops when no progress (same url+dom_hash) or plan is only screenshots.
-    """
-    _SESSION.ensure()
-    history = []
-    prev_url, prev_hash = "", ""
-    no_progress_count = 0
+    client = OpenAI()
+    
+    elements_context = f"\nVISIBLE ELEMENTS ON PAGE:\n{all_visible_elements_string}" if all_visible_elements else "\nNo elements extracted."
+    
+    system_message = (
+        "You are an automation planner analyzing screenshots and DOM elements. "
+        "Return JSON with 'selector' key. "
+        "CRITICAL: Goal is complete ONLY when the full task is done (logged in AND at dashboard, project created AND saved). "
+        "Seeing a button to click is NOT completion - you must click it and complete the task. "
+        f"{elements_context}"
+    )
+    
+    # Send image to GPT-4o for visual understanding
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": system_message
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"""Analyze this screenshot of the Linear app.
 
-    for i in range(1, max_iters+1):
-        dig = _collect_digest()
-        cur_url, cur_hash = dig["url"], dig["dom_hash"]
-        shot0 = snap(f"iter{i:02d}_snapshot")
+User Goal: {state["goal"]}
 
-        if i > 1 and cur_url == prev_url and cur_hash == prev_hash:
-            no_progress_count += 1
-            max_no_progress = 5 if dig.get("logged_in_guess", False) else 2
-            if no_progress_count >= max_no_progress:
-                history.append({"iter": i, "status": "stuck_no_progress", "url": cur_url})
-                break
+Instructions:
+1. Analyze the screenshot - what do you see?
+2. Is the goal "{state["goal"]}" FULLY complete? (NOT just "button visible", but task DONE)
+3. If NO, what is the NEXT action to progress?
+
+Return JSON with these keys:
+- "action_type": "click" (for buttons/links) or "type" (for input fields)
+- "selector": Playwright selector for the element
+- "action_text": Text to type (if action_type is "type"), otherwise empty string
+
+CRITICAL:
+- Goal complete ONLY when task is DONE (logged in AND at dashboard, project created AND saved)
+- If goal complete: {{"action_type": "click", "selector": "", "action_text": ""}}
+- If need to click: {{"action_type": "click", "selector": "text=Log in", "action_text": ""}}
+- If need to type into rich text field: {{"action_type": "type", "selector": "[aria-label='Project name']", "action_text": "bayat123456"}}
+- If need to type into regular input: {{"action_type": "type", "selector": "input[placeholder='Add a short summary']", "action_text": "Description here"}}
+- For project name from goal "{state["goal"]}", extract the name (e.g., "bayat123456") and use it
+- SELECTOR RULES:
+  * For "Rich text field: aria-label='X'" use: [aria-label='X'] or [role='textbox'][aria-label='X']
+  * For "Input placeholder='X'" use: input[placeholder='X'] or textarea[placeholder='X']
+  * For buttons/links: text=, button:has-text(), [data-testid='...']
+- ONLY use elements from the VISIBLE ELEMENTS list above
+- If element not found, modal may be closed - suggest opening it first
+
+Return valid JSON only."""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{state['img_base64']}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=500
+    )
+    
+    # Parse response
+    raw_content = response.choices[0].message.content
+    
+    if not raw_content:
+        print("⚠️  GPT-4 Vision returned empty response")
+        state["selector"] = ""
+        return state
+    
+    try:
+        analysis_json = json.loads(raw_content)
+        action_type = analysis_json.get("action_type", "click").lower()
+        selector = analysis_json.get("selector", "")
+        action_text = analysis_json.get("action_text", "")
+        
+        print("\n" + "="*70)
+        print("🤖 GPT-4 Vision Decision:")
+        print("="*70)
+        print(f"Action Type: {action_type}")
+        print(f"Selector: {selector}")
+        if action_type == "type":
+            print(f"Text to Type: {action_text}")
+        print("="*70 + "\n")
+        
+        state["action_type"] = action_type
+        state["selector"] = selector
+        state["action_text"] = action_text
+        
+    except json.JSONDecodeError as e:
+        print(f"⚠️  Failed to parse JSON: {e}")
+        print(f"Raw response: {raw_content}")
+        # Fallback: assume click action
+        state["action_type"] = "click"
+        state["selector"] = raw_content.strip() if raw_content else ""
+        state["action_text"] = ""
+    
+    return state
+
+def executor(state: AgentState) -> AgentState:
+    """Execute the action - click or type based on action_type"""
+    print("🤖 Executor: Executing the action...")
+    page = get_page()
+    
+    selector = state.get("selector", "").strip()
+    action_type = state.get("action_type", "click").lower()
+    action_text = state.get("action_text", "")
+    
+    if not selector:
+        print("⚠️  No selector provided, skipping action")
+        return state
+    
+    try:
+        # Wait a bit for any modals/animations to settle
+        page.wait_for_timeout(800)
+        
+        # Try to locate the element with wait
+        print(f"🔍 Looking for element: {selector}")
+        
+        # Wait for element to be attached to DOM (give modals time to appear)
+        try:
+            page.wait_for_selector(selector, state="attached", timeout=5000)
+        except Exception as wait_err:
+            print(f"⚠️  Element not found after waiting, trying anyway: {wait_err}")
+        
+        loc = page.locator(selector)
+        
+        # Handle multiple matches - use first visible element
+        count = loc.count()
+        if count > 1:
+            print(f"⚠️  Found {count} matching elements, using first one")
+            loc = loc.first
+        elif count == 0:
+            # Try with case-insensitive search for placeholders
+            if "placeholder=" in selector.lower():
+                print("⚠️  Exact placeholder not found, trying case-insensitive...")
+                # Extract placeholder text
+                match = re.search(r"placeholder=['\"](.+?)['\"]", selector, re.IGNORECASE)
+                if match:
+                    placeholder_text = match.group(1)
+                    # Try to find any input with similar placeholder
+                    all_inputs = page.locator("input, textarea").all()
+                    for inp in all_inputs:
+                        inp_placeholder = inp.get_attribute("placeholder") or ""
+                        if placeholder_text.lower() in inp_placeholder.lower():
+                            print(f"✓ Found input with placeholder: {inp_placeholder}")
+                            loc = page.locator(f"input[placeholder*='{placeholder_text}' i], textarea[placeholder*='{placeholder_text}' i]").first
+                            break
+                    else:
+                        raise Exception(f"No input with placeholder containing '{placeholder_text}'")
+                else:
+                    raise Exception(f"No elements found for selector: {selector}")
+            else:
+                raise Exception(f"No elements found for selector: {selector}")
+        
+        if action_type == "type":
+            # Type action: fill input field
+            print(f"📝 Typing into: {selector}")
+            print(f"Text: '{action_text}'")
+            
+            # Wait for element to be visible and interactable
+            loc.wait_for(state="visible", timeout=5000)
+            
+            # Check if it's a contenteditable div (rich text editor)
+            is_contenteditable = loc.evaluate("el => el.contentEditable === 'true'")
+            
+            if is_contenteditable:
+                print("  (contenteditable div detected - using keyboard input)")
+                # Focus the element
+                loc.click(timeout=3000)
+                # Select all existing text and delete
+                page.keyboard.press("Meta+A")  # Cmd+A on Mac
+                page.keyboard.press("Backspace")
+                # Type the new text
+                page.keyboard.type(action_text, delay=50)
+            else:
+                # Regular input/textarea
+                print("  (regular input field)")
+                loc.click(timeout=3000)
+                loc.fill(action_text)  # fill() is faster for regular inputs
+            
+            page.wait_for_timeout(500)
+            print(f"✓ Typed '{action_text}' successfully")
+            
         else:
-            no_progress_count = 0
+            # Click action (default)
+            print(f"🖱️  Clicking: {selector}")
+            
+            # Wait for element to be visible and clickable
+            loc.wait_for(state="visible", timeout=5000)
+            
+            loc.click(timeout=5000)
+            page.wait_for_timeout(1500)  # Wait for navigation/modal
+            print(f"✓ Click successful! Current URL: {page.url}")
+            
+    except Exception as e:
+        error_msg = str(e)[:300]
+        print(f"❌ Action failed: {error_msg}")
+    
+    return state
 
-        # Plan
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        planner_input = {
-            "goal": goal,
-            "page": dig,
-            "already_logged_in": dig.get("logged_in_guess", False),
-            "credentials": {"email": os.getenv("LINEAR_EMAIL",""), "password": os.getenv("LINEAR_PASSWORD","")}
-        }
-        resp = llm.invoke([PLANNER_SYS, HumanMessage(content=json.dumps(planner_input, ensure_ascii=False))])
-        plan = resp.content if isinstance(resp.content, dict) else _coerce_plan_from_text(str(resp.content))
-        steps = plan.get("steps", [])
-        print(f"📋 Iter {i}: steps -> {[s.get('op') for s in steps]}")
+def set_goal(state: AgentState) -> AgentState:
+    """Set the goal of the agent"""
+    state["goal"] = input("Enter the goal of the agent: ")
+    return state
+def decide_next_action(state: AgentState) -> str:
+    """Decide the next action based on the state"""
+    if state["selector"] == "":
+        return "end"
+    else:
+        return "next_action"
 
-        if not steps or all(s.get("op") == "screenshot" for s in steps):
-            history.append({"iter": i, "status": "no_actionable_steps", "url": cur_url})
-            break
 
-        # Execute via the tool (reuses robust code paths + screenshots)
-        exec_res = json.loads(execute_plan.invoke({"plan": plan}))
-        history.append({"iter": i, "plan": plan, "executed": exec_res})
-
-        if wait_hint:
-            try:
-                WebDriverWait(_SESSION.driver, 5).until(lambda d: wait_hint in (d.current_url or ""))
-            except Exception:
-                pass
-
-        dig2 = _collect_digest()
-        prev_url, prev_hash = dig2["url"], dig2["dom_hash"]
-
-    final_shot = snap("final")
-    final_url = _SESSION.driver.current_url
-    final_dom = _SESSION.driver.execute_script("return document.documentElement.outerHTML || '';")
-    success = _detect_logged_in(final_url, final_dom)
-
-    return json.dumps({
-        "ok": True,
-        "history": history,
-        "final_url": final_url,
-        "final_screenshot": final_shot,
-        "logged_in": success
-    })
-
-# ================= Wire tools into an agent graph =================
-TOOLS = [
-    start_session, open_url, restore_cookies, persist_cookies,
-    wait_url_contains, click, fill, screenshot,
-    fill_first_text_field, click_button_by_text,
-    snapshot_elements, propose_actions, execute_plan, run_goal
-]
-
-llm_router = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(TOOLS)
-
-ROUTER_SYS = SystemMessage(content=(
-    "Coordinator. Use tools ONLY. Typical cycle:\n"
-    "start_session -> (restore_cookies?) -> open_url -> run_goal.\n"
-    "Do not emit plain text. Keep going until run_goal completes."
-))
-
-def agent_node(state: AgentState) -> AgentState:
-    resp = llm_router.invoke([ROUTER_SYS] + state["messages"])
-    return {"messages": [resp]}
-
-def should_continue(state: AgentState):
-    last = state["messages"][-1]
-    return "continue" if getattr(last, "tool_calls", None) else "end"
-
+# Build graph
 graph = StateGraph(AgentState)
-graph.add_node("agent", agent_node)
-graph.add_node("tools", ToolNode(TOOLS))
-graph.set_entry_point("agent")
-graph.add_conditional_edges("agent", should_continue, {"continue": "tools", "end": END})
-graph.add_edge("tools", "agent")
+graph.add_node("goal", set_goal)
+graph.add_node("inspector", inspector)
+graph.add_node("planner", planner)
+graph.add_node("executor", executor)
+graph.add_edge(START, "goal")
+graph.add_edge("goal", "inspector")
+graph.add_edge("inspector", "planner")
+graph.add_edge("planner", "executor")
+graph.add_conditional_edges("executor", decide_next_action, {
+    "next_action": "inspector",
+    "end": END
+})
+
 app = graph.compile()
 
-# ============================ Demo ============================
 if __name__ == "__main__":
-    allow = [
-        os.getenv("ALLOW1", "https://linear.app"),
-        os.getenv("ALLOW2", "https://app.linear.app"),
-    ]
-    seed_url = os.getenv("SEED_URL", "https://linear.app/login")
-
-    goal = os.getenv(
-        "GOAL",
-        "Create a new project named 'testbayat' and save it, then take a final screenshot."
-    )
-
-    inputs = {"messages": [
-        HumanMessage(content=json.dumps({
-            "goal": goal,
-            "allowlist": allow,
-            "seed_url": seed_url,
-            "plan_hint": [
-                {"tool":"start_session","args":{
-                    "allowlist": allow,
-                    "headed": True
-                }},
-                {"tool":"restore_cookies","args":{"domain_hint": allow[0]}},
-                {"tool":"open_url","args":{"url": seed_url}},
-                # The router continues with run_goal which uses propose_actions -> execute_plan
-                {"tool":"run_goal","args":{"goal": goal, "max_iters": 12, "wait_hint":"app."}}
-            ]
-        }))
-    ]}
-
-    for s in app.stream(inputs, stream_mode="values", config={"recursion_limit": 30}):
-        msg = s["messages"][-1]
-        try:
-            msg.pretty_print()
-        except Exception:
-            print(msg)
-
-    print("\n" + "="*80)
-    print("✅ Automation complete! Browser will stay open for 5 minutes.")
-    print(f"📸 Screenshots saved to: {STEP_DIR.absolute()}")
-    print("="*80)
-    print("\nPress Ctrl+C to close browser now, or it will auto-close in 5 minutes...")
     try:
-        time.sleep(300)
-    except KeyboardInterrupt:
-        print("\n👋 Closing browser...")
-    if _SESSION.driver:
-        _SESSION.driver.quit()
-        print("Browser closed.")
+        init_state = {
+            "messages": [HumanMessage(content="I want to create a new project")],
+            "screenshot": "",
+            "img_base64": "",
+            "goal": "",
+            "selector": "",
+            "action_type": "click",
+            "action_text": "",
+            "visible_buttons": [],
+            "visible_inputs": [],
+            "is_first_visit": True
+        }
+        
+        config = {"recursion_limit": 50}
+        final_state = app.invoke(init_state, config)
+        
+        print("\n" + "="*70)
+        print("COMPLETE")
+        print("="*70)
+        print(f"Goal: {final_state.get('goal')}")
+        print(f"Messages exchanged: {len(final_state['messages'])}")
+        
+    finally:
+        # Clean up Playwright resources
+        print("\n🧹 Cleaning up...")
+        cleanup_browser()
