@@ -9,7 +9,7 @@ import base64
 import json
 import re
 load_dotenv()
-
+i=0
 # Global playwright resources (will be initialized in main)
 _playwright = None
 _browser = None
@@ -59,7 +59,7 @@ def inspector(state: AgentState) -> AgentState:
     
     if is_first:
         print("📸 Inspector: Navigating to Linear...")
-        page.goto("https://www.linear.app", wait_until="load", timeout=60000)
+        page.goto("https://www.notion.com/", wait_until="load", timeout=60000)
         page.wait_for_timeout(2000)  # Let page hydrate
         state["is_first_visit"] = False
     else:
@@ -68,7 +68,9 @@ def inspector(state: AgentState) -> AgentState:
         
     # Check for authentication pages - pause for manual login
     current_url = page.url
-    if '/login' in current_url or '/signup' in current_url or '/auth' in current_url:
+    # Use regex to detect login/auth pages (case-insensitive)
+    login_pattern = re.compile(r'(login|signin|sign-in|signup|sign-up|auth|authenticate|register)', re.IGNORECASE)
+    if login_pattern.search(current_url):
         print("\n" + "="*70)
         print("🔐 AUTHENTICATION REQUIRED")
         print("="*70)
@@ -251,9 +253,11 @@ Return valid JSON only."""
 
 def executor(state: AgentState) -> AgentState:
     """Execute the action - click or type based on action_type"""
+    global i
     print("🤖 Executor: Executing the action...")
     page = get_page()
-    
+    i+=1
+    page.screenshot(path=f"screenshots/step_{i}.png")
     selector = state.get("selector", "").strip()
     action_type = state.get("action_type", "click").lower()
     action_text = state.get("action_text", "")
