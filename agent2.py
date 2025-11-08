@@ -11,6 +11,9 @@ import base64
 import json
 import re
 import os
+from collections import Counter
+import math
+from urllib.parse import urlparse
 load_dotenv()
 
 # Create screenshots directory
@@ -26,6 +29,263 @@ _playwright = None
 _browser = None
 _context = None
 _page = None
+
+class RAGDoc(dict):
+    # fields: app, intent, title, text
+    pass
+
+class TinyRAG:
+    def __init__(self):
+        self.docs: list[RAGDoc] = []
+        self.vocab: Counter = Counter()
+        self.df: Counter = Counter()
+        self.N = 0  # number of docs
+
+    def _tok(self, s: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", s.lower())
+
+    def add(self, app: str, intent: str, title: str, text: str):
+        doc = RAGDoc(app=app, intent=intent, title=title, text=text)
+        self.docs.append(doc)
+        self.N += 1
+        terms = set(self._tok(text))
+        for t in terms:
+            self.df[t] += 1
+        for t in self._tok(text):
+            self.vocab[t] += 1
+
+    def _tfidf_vec(self, text: str) -> dict[str, float]:
+        tokens = self._tok(text)
+        tf = Counter(tokens)
+        vec = {}
+        for t, f in tf.items():
+            idf = math.log((self.N + 1) / (1 + self.df.get(t, 0))) + 1.0
+            vec[t] = (f / max(1, len(tokens))) * idf
+        return vec
+
+    def _cos(self, a: dict[str,float], b: dict[str,float]) -> float:
+        if not a or not b: return 0.0
+        common = set(a.keys()) & set(b.keys())
+        num = sum(a[t]*b[t] for t in common)
+        da = math.sqrt(sum(v*v for v in a.values()))
+        db = math.sqrt(sum(v*v for v in b.values()))
+        return 0.0 if (da==0 or db==0) else num/(da*db)
+
+    def retrieve(self, query: str, k: int = 5, app: str|None=None, intent: str|None=None) -> list[RAGDoc]:
+        qv = self._tfidf_vec(query)
+        scored = []
+        for d in self.docs:
+            if app and d["app"] not in (app, "generic"): 
+                continue
+            if intent and d["intent"] not in (intent, "generic"):
+                continue
+            dv = self._tfidf_vec(d["text"])
+            scored.append((self._cos(qv, dv), d))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [d for _, d in scored[:k]]
+
+def detect_app(url: str) -> str:
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+    if "notion." in host or "notion.so" in host:
+        return "notion"      # used only as a hint; logic stays generic
+    return "generic"
+
+def parse_intent_min(goal: str) -> str:
+    gl = goal.lower()
+    if any(k in gl for k in ["create", "add", "new"]):
+        return "create"
+    if any(k in gl for k in ["update", "rename", "edit"]):
+        return "modify"
+    if any(k in gl for k in ["delete", "remove"]):
+        return "delete"
+    if any(k in gl for k in ["theme", "appearance", "dark mode", "settings"]):
+        return "settings"
+    if any(k in gl for k in ["filter", "search", "find"]):
+        return "filter"
+    return "generic"
+
+# Instantiate and seed tiny knowledge
+RAG = TinyRAG()
+# ===== Generic cross-app navigation heuristics =====
+RAG.add("generic","create","Creation affordances",
+"""To create things, prefer buttons/links whose labels match: new|add|create|\\+.
+
+CRITICAL SEQUENCE (always follow this order!):
+1. If goal says "create/add/new X", FIRST click creation button (New, Add, +, Create)
+2. Wait for new entry to appear (new row, modal, or focused textbox)
+3. THEN type into the new entry's input field
+
+CONTEXT MATTERS - Where to find creation buttons:
+- **Content area (main view)**: Toolbar buttons like "New", "Add task", blue "New" button
+  → These create items IN THE CURRENT VIEW (tasks in a list, rows in a table)
+- **Sidebar**: "New page", "Add a page" buttons
+  → These create NEW PAGES, not items in the current list!
+
+For "create task on To Do List":
+→ Look for "New" button in the CONTENT area/toolbar, NOT sidebar!
+→ After clicking, wait for UI to update (new row, inline form, or modal)
+→ Look for NEW textbox that appeared (not existing textboxes!)
+→ Type into THAT new textbox
+
+TEXTBOX PRIORITY after creation:
+1. Textboxes with "new", "untitled", "empty", "add" in name (indicates new entry)
+2. Textboxes that just appeared (weren't there before clicking "New")
+3. Avoid textboxes with "Start typing to edit text" if they existed before
+
+DO NOT:
+- Type into existing page title textboxes before creating the new item
+- Click sidebar "New page" when goal is to create an item in current list  
+- Skip the creation button and type directly
+- Use old textboxes that were visible before clicking creation button
+
+Templates: If modal appears, pick blank/empty option before naming.""")
+
+RAG.add("generic","settings","Settings surface discovery",
+"""When goal mentions settings/theme/appearance/preferences/account, find Settings using spatial patterns:
+
+COMMON UI POSITIONS FOR SETTINGS:
+- **Top-right corner**: Profile/avatar buttons, user menus (often contain Preferences/Account)
+- **Top-left corner**: Workspace/app name buttons, hamburger menus (often contain Settings)
+- **Sidebar (left or bottom)**: Direct [button] Settings, [link] Preferences
+- **Bottom-left corner**: Sometimes settings/gear icons in sidebars
+
+WHAT TO LOOK FOR:
+1. Direct access: [button] Settings, [link] Preferences, [menuitem] Account
+2. Menu buttons: Any button with "Menu" in name, regardless of what comes before it
+3. Corner buttons: Buttons positioned in top-left, top-right, or bottom corners
+4. Expandable elements: Buttons that likely contain submenus (workspace names, avatars)
+
+NAVIGATION STRATEGY (systematic search):
+1. Scan visible elements for direct [button] Settings
+2. Look for buttons containing "Menu" keyword → click to expand
+3. Look for buttons in typical menu positions (corners, sidebar edges)
+4. After expanding menu: scan for Settings/Preferences/Account options
+5. Inside Settings: use search or navigate tabs based on goal keywords
+
+SPATIAL HINTS:
+- If button is in sidebar bottom → likely utility (Settings, Help, Trash)
+- If button is in top-right → likely user menu (Profile, Account, Preferences)
+- If button is in top-left → likely workspace/app menu (Settings, Members, Billing)
+
+AVOID: Hovering randomly before checking obvious menu buttons!""")
+
+RAG.add("generic","create","Completion cues for lists/tables",
+"""Consider completion when a toolbar with Filter|Sort|Group or a View tab appears,
+AND the title field (textbox/contenteditable) matches the desired name.
+If title mismatches, focus the nearest visible naming field and type the target name.""")
+
+RAG.add("generic","generic","UI layout patterns",
+"""Modern web apps follow common spatial patterns:
+
+**Top navigation bar (horizontal):**
+- Left side: App logo, workspace name, main navigation (Projects, Issues, Views)
+- Right side: Search, notifications, help menu, profile/avatar
+
+**Sidebar (vertical, usually left):**
+- Top: Navigation links (Home, Inbox, etc.)
+- Middle: Content tree (pages, folders, projects)
+- Bottom: Settings, Help, Trash, utility buttons
+
+**Click priority for different goals:**
+- Settings/Preferences → Check sidebar bottom, then top-right profile menu, then top-left workspace menu
+- Create/Add → Look for + buttons or "New" buttons in toolbar or sidebar
+- Filter/Search → Look for toolbar buttons or top-right search box
+- Navigation → Use main nav bar (top) or sidebar links
+
+When exploring, check corners and edges systematically before random hovering!""")
+
+RAG.add("generic","generic","Exploration policy",
+"""When stuck and target element not immediately visible:
+1. First, check if it's hidden in a menu (click menus in corners or with "Menu" in name)
+2. If still not found, SCROLL down to reveal more content
+3. As last resort, HOVER on promising expandable elements (dropdowns, accordions)
+
+AVOID: Hovering on generic 'more' buttons as first action - exhaust direct navigation first!""")
+
+RAG.add("generic","filter","Filter and search workflows",
+"""To filter items by criteria:
+1. FIRST ensure you're on the correct page (Projects vs Issues vs Views).
+2. Click 'Add filter' or 'Filter' button to open filter menu.
+3. If a searchbox appears (like 'Filter…'), TYPE the filter value directly (e.g., 'In Progress').
+4. For multi-step filters (e.g., 'Status = In Progress'):
+   - After clicking filter, a searchbox often appears - type the target value.
+   - Or click the field name (Status), then select the value from dropdown.
+5. Avoid looking for radio buttons that don't exist - use the searchbox!""")
+
+RAG.add("generic","filter","Page navigation before filtering",
+"""If goal mentions filtering PROJECTS, ensure you're on the Projects page first.
+If goal mentions filtering ISSUES, ensure you're on the Issues page first.
+Look for navigation links/buttons like [button] Projects, [link] Projects, [button] Issues.
+Click them BEFORE applying filters.""")
+
+RAG.add("generic","generic","Multi-step workflows",
+"""Many workflows require multiple steps in sequence:
+- Invitation: Click 'Invite' button → Modal opens → Type email → Click 'Send invite'
+- Application: Click job listing → Click 'Apply' → Fill form → Click 'Submit'
+- Creation with naming: Click 'New' → Type name → Auto-saves (complete)
+- Filter/Search: Type value → Press Enter → Complete
+
+Opening a modal (via 'Invite', 'Add', 'Create') is NOT completion - it's step 1.
+Look for textboxes/forms that appeared after clicking, then fill them.
+Final buttons like 'Send', 'Submit', 'Confirm' indicate completion.""")
+
+RAG.add("generic","generic","Semantic element matching",
+"""Use semantic understanding to match elements - don't be too literal!
+
+CREATION BUTTONS (all mean the same thing):
+- "New task", "+ New task", "Add task", "New", "+", "Add", "Create task"
+- Match using flexible regex: new|add|create|\\+
+- ALL of these create a new entry - pick the one that's visible!
+
+SETTINGS/PREFERENCES (all mean the same thing):
+- "Settings", "Preferences", "Account", "Profile settings", "Workspace settings"
+- Match using: setting|preference|account|profile
+
+INVITATION/MEMBERS (all mean the same thing):
+- "Invite", "Add members", "Invite people", "Add user", "Invite team"
+- Match using: invite|add.*member|add.*people
+
+When looking for an element, use BROAD patterns to catch variations!""")
+
+RAG.add("generic","generic","Data extraction from goals",
+"""Extract specific values from goals and use them in your actions:
+- Email addresses: user@domain.com format → type into email/search fields
+- Names/titles: text after 'name it', 'call it', 'titled', 'write the following' → type into title/name fields
+- Filter criteria: text after 'by', 'being', 'equals' → type into filter/search boxes
+- Search terms: text after 'search for', 'find' → type into search fields
+
+Example goals and what to type:
+- "invite user@email.com" → type "user@email.com" into email field
+- "create task and write: X" → type "X" into task name field
+- "filter by status being Done" → type "Done" into filter box""")
+
+RAG.add("generic","generic","Action buttons on detail views",
+"""Some buttons only appear after selecting an item:
+- LinkedIn: 'Easy Apply' appears after clicking a job listing
+- Email: 'Reply' appears after clicking an email
+- Task manager: 'Edit' appears after clicking a task
+
+If looking for an action button (Apply, Edit, Delete, Reply) but it's not visible:
+1. Look for item listings/rows/cards
+2. Click one item to open its detail view
+3. The action button will appear in the detail panel""")
+
+# Optional: app-hint docs (still generic language)
+RAG.add("notion","create","Hint: contenteditable titles",
+"""Title fields may be contenteditable elements (role textbox or contenteditable='true').
+Click once, Select All, Backspace, then type the desired name. Avoid template search boxes when naming.""")
+
+RAG.add("notion","create","Hint: template dialogs",
+"""If a creation modal offers multiple templates, pick a blank/empty option before typing names.
+Typing into a search field inside the template picker does not rename the new item.""")
+
+    # ---------- Minimal RAG injection ----------
+
+
+
 
 def get_page() -> Page:
     """Get or create page instance"""
@@ -291,16 +551,23 @@ IMPORTANT CONTEXT:
 - Look for evidence of completion (e.g., member count increased, confirmation message, modal closed)
 
 DECISION RULES:
-1. If goal = "create [something] and name/call it [X]" AND current state = "Typed '[X]' into textbox"
-   → goal_satisfied = TRUE (creation + naming complete in one action!)
-2. If goal = "invite people" AND current state = "Clicked button 'Send invite'"
-   → goal_satisfied = TRUE (invitation sent!)
-3. If goal = "apply for job" AND current state = "Clicked button 'Submit application'"
-   → goal_satisfied = TRUE (application submitted!)
-4. If goal has additional DISTINCT steps (e.g., "create X, name it Y, THEN add description")
-   → Check if current state completed ALL steps, not just first
-5. If goal mentions a CONTEXT ("from settings", "via menu") but the ACTION is complete
-   → goal_satisfied = TRUE (context is just navigation, not the goal itself!)
+1. Multi-step workflows: Opening a modal/dialog is NOT completion - it's just step 1!
+   - "Clicked 'Invite members'" = opened modal, not done
+   - "Clicked 'Send invite'" = sent invitation, complete!
+   - "Clicked 'Apply'" = opened form, not done
+   - "Clicked 'Submit application'" = submitted, complete!
+
+2. Auto-save workflows (Notion, Linear, etc.):
+   - "Typed name into NEW entry" = creation complete (auto-saves)
+   - No submit button needed for naming/creating
+
+3. Filter/search workflows:
+   - "Typed filter value and submitted (Enter)" = filter applied, complete!
+
+4. Context vs Action:
+   - Goal mentions WHERE ("from settings", "via menu") = just navigation
+   - Focus on the ACTION ("invite email", "change theme", "create db")
+   - If ACTION complete, goal satisfied (regardless of path taken)
 
 Return JSON:
 {{
@@ -794,6 +1061,13 @@ def planner(state: AgentState) -> AgentState:
     actions_performed = state.get("actions_performed", [])
     client = OpenAI()
 
+    # ---- RAG: Retrieve relevant knowledge ----
+    app_hint = detect_app(page.url or state.get("website_url", ""))
+    intent_hint = parse_intent_min(state.get("goal", ""))
+    rag_query = f"{app_hint} {intent_hint} {state.get('goal', '')}"
+    rag_hits = RAG.retrieve(rag_query, k=4, app=app_hint, intent=intent_hint)
+    rag_context = "\n".join([f"- {h['title']}: {h['text']}" for h in rag_hits])
+
     # ---- Intent helper (scoped here) ----
     def infer_intent(goal: str) -> set[str]:
         g = (goal or "").lower()
@@ -875,6 +1149,9 @@ You will output ONE JSON object only:
   "action_text": "text to type OR key name (Enter, Tab, Escape) OR scroll direction (down, up)"
 }}
 
+# Context Hints (RAG):
+{rag_context or "- (no extra hints)"}
+
 ### STRATEGY
 - Interpret the goal semantically (create≈add≈new≈+; search≈find≈filter; dark mode≈theme≈appearance).
 - Navigation > Interaction > Confirmation.
@@ -905,6 +1182,9 @@ Return ONLY the JSON object.
 
 State Snapshot (JSON):
 {snapshot_json}
+
+Knowledge Base (RAG-retrieved tips):
+{rag_context}
 
 Heuristics/history:
 {failed_context}
@@ -1016,39 +1296,47 @@ Return JSON only:"""
         
         goal_lower = (state["goal"] or "").lower()
 
-        # OVERRIDE -1: action button requires selecting an item first
-        action_verbs = ["apply", "edit", "delete", "remove", "modify", "update", "save"]
-        if action_type == "click" and any(verb in name_pattern.lower() for verb in action_verbs):
-            item_links = [el for el in visible_elements if el.get("role") == "link" and len(el.get("name", "")) > 10]
-            actions_performed_local = state.get("actions_performed", [])
-            recent_clicks = [act for act in actions_performed_local[-3:] if "click:link" in act]
-            if item_links and len(recent_clicks) == 0:
-                print(f"⚠️  Looking for action button but haven't selected an item yet!")
-                best_match = find_semantic_match(state["goal"], item_links)
-                if best_match:
-                    action_type = "click"
-                    role = best_match['role']
-                    name_pattern = re.escape(best_match['name'].split()[0]) if best_match['name'] else ".*"
-                    action_text = ""
-
-        # OVERRIDE 0: if goal implies typing/searching
+        # OVERRIDE 0 (minimal): LOGIN if on marketing and login visible
+        current_url = page.url.lower()
+        is_marketing = not any(indicator in current_url for indicator in ["/team/", "/workspace/", "/settings", "/login"])
+        
+        if is_marketing and action_type != "noop":
+            login_el = next(
+                (el for el in visible_elements
+                 if (("log" in el.get("name","").lower() and "in" in el.get("name","").lower())
+                     or ("sign" in el.get("name","").lower() and "in" in el.get("name","").lower()))),
+                None
+            )
+            
+            if login_el:
+                print("🔑 On marketing page - clicking login to access workspace")
+                action_type = "click"
+                role = login_el['role']
+                name_pattern = "log.*in|sign.*in"
+                action_text = ""
+        
+        # OVERRIDE 1: if goal implies typing/searching/filtering
         if action_type == "click" and role in ["combobox", "search", "searchbox", "textbox"]:
-            if any(keyword in goal_lower for keyword in ["search", "find", "type", "enter", "write"]):
-                search_keywords = ["search for", "find", "type", "enter", "write"]
+            if any(keyword in goal_lower for keyword in ["search", "find", "type", "enter", "write", "filter"]):
+                search_keywords = ["search for", "find", "type", "enter", "write", "filter by", "filter"]
                 text_to_type = ""
                 for keyword in search_keywords:
                     if keyword in goal_lower:
                         parts = goal_lower.split(keyword, 1)
                         if len(parts) > 1:
                             remaining = parts[1].strip()
+                            # For filters, extract the actual value (e.g., "In Progress" from "filter by status being In Progress")
                             text_to_type = remaining.split(" and ")[0].split(" then")[0].split(" in ")[0].strip()
+                            # Clean up "status being X" → "X"
+                            text_to_type = re.sub(r'^(status|priority|assignee|project)\s+(being|is|equals?|=)\s+', '', text_to_type, flags=re.IGNORECASE)
                             break
                 if text_to_type:
-                    print(f"⚠️  GPT chose 'click' on search box but goal is to search - overriding to TYPE!")
+                    print(f"⚠️  GPT chose 'click' on search/filter box but goal is to type - overriding to TYPE!")
+                    print(f"  → Will type: '{text_to_type}'")
                     action_type = "type"
                     action_text = text_to_type
 
-        # OVERRIDE 1 (intent-gated settings/profile)
+        # OVERRIDE 2: minimal noop fallback (only for login on marketing pages)
         if action_type == "noop":
             login_el = next(
                 (el for el in visible_elements
@@ -1056,44 +1344,21 @@ Return JSON only:"""
                      or ("sign" in el.get("name","").lower() and "in" in el.get("name","").lower()))),
                 None
             )
-            if login_el:
-                print("⚠️  noop returned but login is visible → clicking login to enter workspace")
+            if login_el and is_marketing:
+                print("⚠️  noop on marketing page with login visible → clicking login")
                 action_type = "click"
                 role = login_el['role']
                 name_pattern = "log.*in|sign.*in"
                 action_text = ""
             else:
-                # Check if we're ALREADY in Settings modal (tabs like "People", "General", "Preferences" visible)
-                in_settings_modal = any(
-                    el.get("role") == "tab" and any(kw in el.get("name", "").lower() for kw in ["people", "general", "preferences", "notifications", "connections"])
-                    for el in visible_elements
-                )
-                
-                if ("settings" in intent) or ("theme" in intent):
-                    # Only click Settings if we're NOT already in Settings modal
-                    if not in_settings_modal:
-                        settings_keywords = ['setting', 'settings', 'preference', 'preferences', 'account', 'profile', 'workspace', 'appearance', 'theme', 'billing']
-                        settings_el = next((el for el in visible_elements if any(k in el.get("name","").lower() for k in settings_keywords)), None)
-                        if settings_el:
-                            print(f"⚠️  noop → goal implies settings/theme; clicking '{settings_el['name']}'")
-                        action_type = "click"
-                        role = settings_el['role']
-                        name_pattern = re.escape(settings_el['name'])
-                        action_text = ""
-                    else:
-                        state["action_type"] = "noop"
-                        state["role"] = ""
-                        state["name_pattern"] = ""
-                        state["action_text"] = ""
-                        return state
-                else:
-                    state["action_type"] = "noop"
-                    state["role"] = ""
-                    state["name_pattern"] = ""
-                    state["action_text"] = ""
-                    return state
+                # GPT chose noop - respect it and terminate
+                state["action_type"] = "noop"
+                state["role"] = ""
+                state["name_pattern"] = ""
+                state["action_text"] = ""
+                return state
 
-        # OVERRIDE 2: ensure TYPE has a matching textbox
+        # OVERRIDE 3: ensure TYPE has a matching textbox
         if action_type == "type":
             textbox_found = any(el.get("role") == "textbox" and re.search(name_pattern, el.get("name", ""), re.IGNORECASE) for el in visible_elements)
             if not textbox_found:
@@ -1102,80 +1367,8 @@ Return JSON only:"""
                     print(f"⚠️  Pattern '{name_pattern}' won't match any textbox → using '.*'")
                     name_pattern = ".*"
 
-        # OVERRIDE 3: after creation, type the name/content
-        just_created_something = any(
-            "click:button" in act and any(kw in act for kw in ["new", "add", "create"])
-            for act in actions_performed[-2:]
-        )
-        needs_to_type = any(keyword in goal_lower for keyword in ["write", "following", "name", "title", "call", "label", "add"])
-        if action_type == "click" and just_created_something and needs_to_type:
-            any_textbox = next((el for el in visible_elements if el.get("role") == "textbox"), None)
-            typed_already = any("type:" in act for act in actions_performed)
-            
-            # CRITICAL: Don't trigger if template/creation options are still visible!
-            # If we see buttons like "Empty database", "Empty page", "Tasks Tracker", etc.,
-            # GPT should click those FIRST before typing.
-            template_keywords = ["empty", "template", "tracker", "hub", "notes", "build with"]
-            has_template_buttons = any(
-                el.get("role") == "button" and any(kw in el.get("name", "").lower() for kw in template_keywords)
-                for el in visible_elements
-            )
-            
-            # Also check for search textbox (common in template pickers) - not the target!
-            is_search_textbox = any_textbox and "search" in any_textbox.get("name", "").lower()
-            
-            if any_textbox and not typed_already and not has_template_buttons and not is_search_textbox:
-                print(f"⚠️  Just created entry! Switching to TYPE mode")
-                import re as regex_module
-                patterns = [
-                    r"name\s+(?:the\s+)?(?:task|entry|page|item|db|database)\s+as[:\s]+(.+?)\.?$",
-                    r"name\s+it[:\s]+(.+?)\.?$",
-                    r"title[:\s]+(.+?)\.?$",
-                    r"call\s+it[:\s]+(.+?)\.?$",
-                    r"write\s+the\s+following[:\s]+(.+?)\.?$",
-                    r"write\s+(.+?)(?:\s+in\s+it)?\.?$",
-                    r"content[:\s]+(.+?)\.?$",
-                    r"add\s+(.+?)(?:\s+as\s+(?:a\s+)?(?:task|entry|item|database))?\.?$",
-                ]
-                text_to_type = None
-                for pattern in patterns:
-                    m = regex_module.search(pattern, state["goal"] or "", regex_module.IGNORECASE)
-                    if m:
-                        text_to_type = m.group(1).strip()
-                        text_to_type = regex_module.sub(r'\s+in\s+(it|the\s+entry)\.?$', '', text_to_type, flags=regex_module.IGNORECASE)
-                        text_to_type = regex_module.sub(r'\s+as\s+(a\s+)?(task|entry|item)\.?$', '', text_to_type, flags=regex_module.IGNORECASE)
-                        break
-                if not text_to_type:
-                    quote_match = regex_module.search(r'["\'](.+?)["\']', state["goal"] or "")
-                    text_to_type = quote_match.group(1) if quote_match else "New entry"
-                
-                # SMART TEXTBOX SELECTION: Prioritize NEW entry's textbox, not existing page
-                all_textboxes = [el for el in visible_elements if el.get("role") == "textbox"]
-                priority_keywords = ["untitled", "new page", "empty", "add title", "start typing"]
-                
-                # Look for a textbox with priority keywords (indicates NEW entry)
-                priority_textbox = next(
-                    (tb for tb in all_textboxes if any(kw in tb.get("name", "").lower() for kw in priority_keywords)),
-                    None
-                )
-                
-                # Use specific pattern to target the NEW entry's textbox
-                if priority_textbox:
-                    # Use first keyword match as pattern
-                    matched_keyword = next(kw for kw in priority_keywords if kw in priority_textbox['name'].lower())
-                    target_pattern = matched_keyword.replace(" ", "\\s+")  # e.g., "start\\s+typing"
-                    print(f"  → Targeting NEW entry's textbox: '{priority_textbox['name']}'")
-                else:
-                    # Fallback: use wildcard (but warn about ambiguity)
-                    target_pattern = ".*"
-                    if len(all_textboxes) > 1:
-                        print(f"  → Multiple textboxes found, using pattern '.*' (may be ambiguous)")
-                
-                action_type = "type"
-                role = "textbox"
-                name_pattern = target_pattern
-                action_text = text_to_type
-
+        # (Removed complex OVERRIDE logic - let RAG + GPT handle workflows naturally)
+        
         # SAFETY CHECK: If GPT returned empty role/pattern for actions that need them, convert to noop
         if action_type in ["click", "type", "hover"] and (not role or not name_pattern):
             print(f"⚠️  GPT returned {action_type} with empty role/pattern - converting to noop")
@@ -1655,19 +1848,20 @@ def executor(state: AgentState) -> AgentState:
                 page.wait_for_timeout(500)
                 print(f"✓ Typed '{action_text}' successfully")
                 
-                # Auto-press Enter for search boxes, comboboxes, or if goal mentions "search"
+                # Auto-press Enter for search boxes, comboboxes, or if goal mentions "search"/"filter"
                 goal_lower = state.get("goal", "").lower()
                 is_search_context = (
                     role in ["combobox", "search", "searchbox"] or
                     "search" in goal_lower or
-                    "find" in goal_lower
+                    "find" in goal_lower or
+                    "filter" in goal_lower
                 )
                 
                 if is_search_context:
-                    print(f"  ⌨️  Auto-pressing Enter to submit search...")
+                    print(f"  ⌨️  Auto-pressing Enter to submit search/filter...")
                     page.keyboard.press("Enter")
-                    page.wait_for_timeout(1000)  # Wait for search results
-                    print(f"  ✓ Enter pressed - search submitted!")
+                    page.wait_for_timeout(1000)  # Wait for results
+                    print(f"  ✓ Enter pressed - search/filter submitted!")
                 
                 # Remove cursor marker
                 try:
@@ -1688,10 +1882,14 @@ def executor(state: AgentState) -> AgentState:
                     # Use GPT to determine if goal is actually complete
                     print(f"  🧠 Checking if typing '{action_text}' completes the goal...")
                     
+                    # Provide context about what was typed (let GPT determine if complete)
+                    goal_text = state.get("goal", "")
+                    context_desc = f"Typed '{action_text}' into the textbox and submitted"
+                    
                     goal_check_achieved = check_goal_achieved_by_state(
-                        goal=state.get("goal", ""),
-                        element_name=f"textbox",
-                        current_state=f"Typed '{action_text}' into the textbox"
+                        goal=goal_text,
+                        element_name="textbox",
+                        current_state=context_desc
                     )
                     
                     if goal_check_achieved:
@@ -1818,12 +2016,9 @@ def executor(state: AgentState) -> AgentState:
                     if modal_visible:
                         print("  ℹ️  Modal/dialog detected after click")
                     
-                    # CHECK GOAL COMPLETION for action buttons (Send, Submit, Apply, Invite, Add, etc.)
-                    # This is critical for workflows that don't involve typing
-                    action_button_keywords = ["send", "submit", "apply", "invite", "add", "create", "save", "post", "publish"]
-                    is_action_button = role == "button" and any(kw in name_pattern.lower() for kw in action_button_keywords)
-                    
-                    if is_action_button:
+                    # CHECK GOAL COMPLETION for buttons (let GPT decide if it's final)
+                    # GPT will understand: "Send invite" = final, "Invite members" = just opens modal
+                    if role == "button":
                         print(f"  🧠 Checking if clicking '{name_pattern}' completes the goal...")
                         
                         goal_achieved = check_goal_achieved_by_state(
@@ -1836,7 +2031,7 @@ def executor(state: AgentState) -> AgentState:
                             print(f"🎯 Goal '{state.get('goal')}' achieved after clicking button! Marking complete.")
                             state["goal_text_entered"] = True
                         else:
-                            print(f"  ℹ️  Clicked button but goal may have additional steps - continuing...")
+                            print(f"  ℹ️  Clicked button but goal has additional steps - continuing...")
                 
                 # Track successful action
                 state.setdefault("actions_performed", []).append(action_key)
