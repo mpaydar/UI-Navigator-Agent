@@ -3,7 +3,7 @@
 ## Graph Representation
 <img width="1016" height="1292" alt="image" src="https://github.com/user-attachments/assets/3ea898bc-62e9-4a92-b45c-2ff9b721cc8c" />
 
-
+## agent2 is the main file to run it make sure you type python agent2.py in the terminal . You might need to install the dependencies!
 
 A. The Inspector will be PlayWright
 
