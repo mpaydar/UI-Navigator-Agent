@@ -1,3 +1,8 @@
+## What the Agent does?
+
+It will let you to write any task on any platform in English and will execute it directly live on the UI. The UI will be provide you screen shot of every steps as the prove of its execution. 
+
+
 ## Current Capabilities
 
 Goal Interpretation: Understands user intents like “Change the start day of the week to Monday in Notion.”
