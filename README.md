@@ -8,7 +8,9 @@ It will let you to write any task on any platform in English and will execute it
 
 ## Current Capabilities
 
-Goal Interpretation: Understands user intents like “Change the start day of the week to Monday in Notion.”
+### Goal Interpretation:
+
+Understands user intents like “Change the start day of the week to Monday in Notion.”
 
 Autonomous Execution: Uses Playwright for live browser interaction, clicking, typing, and navigating across pages.
 
@@ -70,7 +72,6 @@ Deploy a hosted demo version showing real-time navigation with transparent reaso
 ## Graph Representation
 <img width="1016" height="1292" alt="image" src="https://github.com/user-attachments/assets/3ea898bc-62e9-4a92-b45c-2ff9b721cc8c" />
 
-## agent2 is the main file to run it make sure you type python agent2.py in the terminal . You might need to install the dependencies!
 
 A. The Inspector will be PlayWright
 
