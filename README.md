@@ -1,3 +1,6 @@
+<img width="1600" height="800" alt="image" src="https://github.com/user-attachments/assets/53b4be81-5ca0-4ee9-b84e-c1a56520910c" />
+
+
 ## What the Agent does?
 
 It will let you to write any task on any platform in English and will execute it directly live on the UI. The UI will be provide you screen shot of every steps as the prove of its execution. 
